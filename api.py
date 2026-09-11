@@ -1,98 +1,88 @@
-import io
-import json
+import ast
+import math
+import operator
 import os
 import re
-from typing import Any
+from typing import Union
 
 import streamlit as st
-from docx import Document
 from google import genai
 from google.genai import types
-from pypdf import PdfReader
 
 
 # ============================================================
-# Configuration
+# CONFIGURATION
 # ============================================================
 
-APP_TITLE = "ATS Resume Analyzer"
-MODEL_NAME = "gemini-2.5-flash"
-
-MAX_FILE_SIZE_MB = 10
-ALLOWED_EXTENSIONS = ["pdf", "docx"]
+APP_TITLE = "AI Calculator"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 # ============================================================
-# Page configuration
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title=APP_TITLE,
-    page_icon="📄",
-    layout="wide",
+    page_icon="🧮",
+    layout="centered",
 )
 
 
 # ============================================================
-# Custom styling
+# STYLING
 # ============================================================
 
 st.markdown(
     """
     <style>
         .main-title {
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin-bottom: 0.25rem;
+            font-size: 2.6rem;
+            font-weight: 800;
+            text-align: center;
+            margin-bottom: 0.2rem;
         }
 
         .subtitle {
+            text-align: center;
             color: #6b7280;
-            font-size: 1.05rem;
             margin-bottom: 2rem;
         }
 
-        .score-box {
+        .result-box {
             padding: 1.5rem;
-            border-radius: 15px;
-            text-align: center;
+            border-radius: 16px;
             background: linear-gradient(
                 135deg,
-                #f8fafc 0%,
-                #eef2ff 100%
+                #eef2ff,
+                #f8fafc
             );
             border: 1px solid #e5e7eb;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
         }
 
-        .score-number {
-            font-size: 4rem;
-            font-weight: 800;
-            line-height: 1;
-        }
-
-        .score-label {
+        .result-label {
             color: #6b7280;
-            font-size: 1rem;
+            font-size: 0.9rem;
         }
 
-        .good {
-            color: #16a34a;
+        .result-value {
+            font-size: 2.4rem;
+            font-weight: 800;
+            color: #4f46e5;
         }
 
-        .medium {
-            color: #ca8a04;
+        .history-item {
+            padding: 0.75rem;
+            border-bottom: 1px solid #e5e7eb;
         }
 
-        .poor {
-            color: #dc2626;
-        }
-
-        .info-card {
+        .example-box {
             padding: 1rem;
             border-radius: 10px;
+            background: #f8fafc;
             border: 1px solid #e5e7eb;
-            background: #ffffff;
-            margin-bottom: 0.75rem;
         }
     </style>
     """,
@@ -101,737 +91,600 @@ st.markdown(
 
 
 # ============================================================
-# Utility functions
+# API KEY
 # ============================================================
 
 def get_api_key() -> str:
     """
-    Get Gemini API key from Streamlit secrets first,
+    Read Gemini API key from Streamlit secrets first,
     then environment variables.
     """
+
     try:
-        secret_key = st.secrets.get("GEMINI_API_KEY")
-        if secret_key:
-            return secret_key
+        key = st.secrets.get("GEMINI_API_KEY")
+
+        if key:
+            return key
     except Exception:
         pass
 
-    env_key = os.getenv("GEMINI_API_KEY")
-    if env_key:
-        return env_key
-
-    return ""
+    return os.getenv("GEMINI_API_KEY", "")
 
 
-def extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract text from a PDF."""
-    reader = PdfReader(io.BytesIO(file_bytes))
+# ============================================================
+# SAFE MATHEMATICAL CALCULATOR
+# ============================================================
 
-    pages = []
+# Allowed mathematical operators.
+BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
+    ast.FloorDiv: operator.floordiv,
+}
 
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        pages.append(text)
+UNARY_OPERATORS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
 
-    return "\n\n".join(pages).strip()
+
+# Allowed mathematical functions.
+SAFE_FUNCTIONS = {
+    "sqrt": math.sqrt,
+    "abs": abs,
+    "round": round,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "log": math.log,
+    "log10": math.log10,
+    "exp": math.exp,
+}
+
+SAFE_CONSTANTS = {
+    "pi": math.pi,
+    "e": math.e,
+}
 
 
-def extract_docx_text(file_bytes: bytes) -> str:
-    """Extract text from a DOCX file."""
-    document = Document(io.BytesIO(file_bytes))
+def safe_eval(node: ast.AST) -> Union[int, float]:
+    """
+    Safely evaluate a mathematical AST.
 
-    paragraphs = [
-        paragraph.text.strip()
-        for paragraph in document.paragraphs
-        if paragraph.text.strip()
-    ]
+    This intentionally does NOT use Python's eval().
+    """
 
-    # Also collect table text because resumes sometimes use tables.
-    table_text = []
+    if isinstance(node, ast.Expression):
+        return safe_eval(node.body)
 
-    for table in document.tables:
-        for row in table.rows:
-            row_text = " | ".join(
-                cell.text.strip()
-                for cell in row.cells
-                if cell.text.strip()
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+
+        raise ValueError("Only numeric values are allowed.")
+
+    if isinstance(node, ast.BinOp):
+        operation = BINARY_OPERATORS.get(type(node.op))
+
+        if operation is None:
+            raise ValueError("Unsupported mathematical operator.")
+
+        left = safe_eval(node.left)
+        right = safe_eval(node.right)
+
+        # Prevent extremely large exponent calculations.
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > 100:
+                raise ValueError(
+                    "Exponent is too large."
+                )
+
+        return operation(left, right)
+
+    if isinstance(node, ast.UnaryOp):
+        operation = UNARY_OPERATORS.get(type(node.op))
+
+        if operation is None:
+            raise ValueError("Unsupported unary operator.")
+
+        return operation(safe_eval(node.operand))
+
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("Unsupported function.")
+
+        function_name = node.func.id
+
+        if function_name not in SAFE_FUNCTIONS:
+            raise ValueError(
+                f"Function '{function_name}' is not allowed."
             )
 
-            if row_text:
-                table_text.append(row_text)
+        function = SAFE_FUNCTIONS[function_name]
 
-    all_text = paragraphs + table_text
+        arguments = [
+            safe_eval(argument)
+            for argument in node.args
+        ]
 
-    return "\n".join(all_text).strip()
+        return function(*arguments)
 
+    if isinstance(node, ast.Name):
+        if node.id in SAFE_CONSTANTS:
+            return SAFE_CONSTANTS[node.id]
 
-def extract_resume_text(uploaded_file) -> str:
-    """Extract readable text from PDF or DOCX."""
-    file_bytes = uploaded_file.getvalue()
-
-    extension = uploaded_file.name.lower().split(".")[-1]
-
-    if extension == "pdf":
-        return extract_pdf_text(file_bytes)
-
-    if extension == "docx":
-        return extract_docx_text(file_bytes)
+        raise ValueError(
+            f"Unknown constant '{node.id}'."
+        )
 
     raise ValueError(
-        "Unsupported file format. Please upload a PDF or DOCX resume."
+        "This expression contains unsupported syntax."
     )
 
 
-def normalize_score(score: Any) -> int:
-    """Safely convert a model score into 0-100."""
-    try:
-        score = int(float(score))
-    except (TypeError, ValueError):
-        score = 0
-
-    return max(0, min(100, score))
-
-
-def score_color(score: int) -> str:
-    if score >= 80:
-        return "good"
-
-    if score >= 60:
-        return "medium"
-
-    return "poor"
-
-
-def clean_json_response(text: str) -> dict:
+def calculate_expression(expression: str) -> float:
     """
-    Safely parse JSON returned by Gemini.
-
-    Handles cases where the model accidentally wraps JSON
-    in markdown code fences.
+    Calculate a mathematical expression safely.
     """
-    text = text.strip()
 
-    # Remove markdown fences if present.
-    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+    expression = expression.strip()
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Attempt to find the outermost JSON object.
-        start = text.find("{")
-        end = text.rfind("}")
+    if not expression:
+        raise ValueError(
+            "Please enter a calculation."
+        )
 
-        if start != -1 and end != -1 and end > start:
-            return json.loads(text[start:end + 1])
+    # Basic input-length protection.
+    if len(expression) > 500:
+        raise ValueError(
+            "Calculation is too long."
+        )
 
-        raise ValueError("Gemini returned invalid JSON.")
+    # Allow common visual multiplication symbol.
+    expression = expression.replace("×", "*")
+    expression = expression.replace("÷", "/")
+
+    # Convert simple percentage syntax:
+    # 15% -> 15/100
+    expression = re.sub(
+        r"(\d+(?:\.\d+)?)\s*%",
+        r"(\1/100)",
+        expression,
+    )
+
+    tree = ast.parse(
+        expression,
+        mode="eval",
+    )
+
+    result = safe_eval(tree)
+
+    if not math.isfinite(result):
+        raise ValueError(
+            "The calculation produced an invalid result."
+        )
+
+    return result
+
+
+def format_number(value: float) -> str:
+    """
+    Make calculator output easier to read.
+    """
+
+    if isinstance(value, int):
+        return str(value)
+
+    if value == int(value):
+        return f"{int(value):,}"
+
+    return f"{value:,.10g}"
 
 
 # ============================================================
-# Gemini analysis
+# GEMINI AI
 # ============================================================
 
-def analyze_resume(resume_text: str, job_description: str = "") -> dict:
+def ask_gemini(user_question: str) -> dict:
     """
-    Analyze a resume using Gemini 2.5 Flash.
+    Ask Gemini to solve/explain a natural-language calculation.
+    """
 
-    The ATS score is an ATS-readiness estimate, not a score
-    generated by a particular ATS vendor.
-    """
     api_key = get_api_key()
 
     if not api_key:
         raise RuntimeError(
-            "Gemini API key not found. Add GEMINI_API_KEY to "
-            "Streamlit secrets or your environment variables."
+            "Gemini API key is missing. Add GEMINI_API_KEY "
+            "to Streamlit secrets."
         )
 
-    client = genai.Client(api_key=api_key)
-
-    job_context = (
-        job_description.strip()
-        if job_description.strip()
-        else "No job description was provided. Evaluate the resume for general ATS readiness."
+    client = genai.Client(
+        api_key=api_key
     )
 
     prompt = f"""
-You are an expert resume reviewer, recruiter, and ATS optimization specialist.
+You are an accurate mathematical assistant.
 
-Analyze the resume below.
+Solve the user's calculation/problem.
 
-IMPORTANT:
-- Do NOT claim this is the exact score from Workday, Greenhouse, Lever,
-  Taleo, or another proprietary ATS.
-- Produce an "ATS readiness score" from 0 to 100 based on the criteria below.
-- Be practical and evidence-based.
-- Do not invent experience, qualifications, achievements, or skills.
-- Suggestions must preserve the candidate's truthfulness.
-- Focus on improvements that genuinely help resume parsing and recruiter review.
-
-ATS READINESS CRITERIA:
-
-1. Contact information: 10 points
-2. Standard resume sections: 10 points
-3. Keyword and skill relevance: 20 points
-4. Work experience quality: 15 points
-5. Quantified achievements/results: 10 points
-6. Formatting and ATS parseability: 15 points
-7. Education/certifications: 5 points
-8. Clarity, conciseness, and professional language: 10 points
-9. Overall consistency: 5 points
-
-TOTAL: 100 points.
-
-JOB DESCRIPTION:
-{job_context}
-
-RESUME:
-----------------
-{resume_text}
-----------------
-
-Return ONLY valid JSON matching this exact structure:
-
-{{
-  "ats_score": 0,
-  "score_summary": "Short explanation of the score",
-  "category_scores": [
-    {{
-      "category": "Contact information",
-      "score": 0,
-      "max_score": 10,
-      "feedback": "Specific feedback"
-    }},
-    {{
-      "category": "Standard resume sections",
-      "score": 0,
-      "max_score": 10,
-      "feedback": "Specific feedback"
-    }},
-    {{
-      "category": "Keyword and skill relevance",
-      "score": 0,
-      "max_score": 20,
-      "feedback": "Specific feedback"
-    }},
-    {{
-      "category": "Work experience quality",
-      "score": 0,
-      "max_score": 15,
-      "feedback": "Specific feedback"
-    }},
-    {{
-      "category": "Quantified achievements/results",
-      "score": 0,
-      "max_score": 10,
-      "feedback": "Specific feedback"
-    }},
-    {{
-      "category": "Formatting and ATS parseability",
-      "score": 0,
-      "max_score": 15,
-      "feedback": "Specific feedback"
-    }},
-    {{
-      "category": "Education/certifications",
-      "score": 0,
-      "max_score": 5,
-      "feedback": "Specific feedback"
-    }},
-    {{
-      "category": "Clarity and professional language",
-      "score": 0,
-      "max_score": 10,
-      "feedback": "Specific feedback"
-    }},
-    {{
-      "category": "Overall consistency",
-      "score": 0,
-      "max_score": 5,
-      "feedback": "Specific feedback"
-    }}
-  ],
-  "strengths": [
-    "Strength 1",
-    "Strength 2",
-    "Strength 3"
-  ],
-  "critical_issues": [
-    "Issue that should be fixed first"
-  ],
-  "improvements": [
-    {{
-      "priority": "High",
-      "area": "Area name",
-      "problem": "What is wrong",
-      "recommendation": "What the candidate should do",
-      "example": "Example of an improved version if possible"
-    }}
-  ],
-  "missing_sections": [
-    "Section name"
-  ],
-  "keyword_analysis": {{
-    "important_keywords_found": [
-      "keyword"
-    ],
-    "important_keywords_missing": [
-      "keyword"
-    ],
-    "note": "Explain the keyword analysis"
-  }},
-  "bullet_point_improvements": [
-    {{
-      "original": "Existing bullet from resume",
-      "improved": "Truth-preserving improved bullet",
-      "reason": "Why the new version is better"
-    }}
-  ],
-  "formatting_checklist": [
-    {{
-      "item": "Formatting item",
-      "status": "Good",
-      "recommendation": "Recommendation"
-    }}
-  ],
-  "final_recommendation": "Short final recommendation"
-}}
+USER QUESTION:
+{user_question}
 
 Rules:
-- ats_score must be an integer from 0 to 100.
-- Category scores must not exceed their max_score.
-- Do not invent facts.
-- If something is unknown, say so.
-- Keep feedback specific.
+1. Give the final numerical answer.
+2. Show the important calculation steps.
+3. Keep the explanation easy to understand.
+4. Do not invent missing information.
+5. If the question is ambiguous, clearly explain what information is missing.
+6. Double-check arithmetic before answering.
+7. Do not give financial, medical, legal, or investment advice.
+   If the user asks for such advice, only perform the requested
+   mathematical calculation and clearly state that the calculation
+   is not professional advice.
+
+Return JSON with exactly these fields:
+
+{{
+  "answer": "Final answer",
+  "steps": [
+    "Step 1",
+    "Step 2"
+  ],
+  "explanation": "Short explanation"
+}}
 """
 
     response = client.models.generate_content(
-        model=MODEL_NAME,
+        model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
-            temperature=0.2,
+            temperature=0.1,
             response_mime_type="application/json",
         ),
     )
 
     if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
+        raise RuntimeError(
+            "Gemini returned an empty response."
+        )
 
-    result = clean_json_response(response.text)
+    import json
 
-    # Normalize important fields.
-    result["ats_score"] = normalize_score(
-        result.get("ats_score", 0)
-    )
-
-    result.setdefault("score_summary", "")
-    result.setdefault("category_scores", [])
-    result.setdefault("strengths", [])
-    result.setdefault("critical_issues", [])
-    result.setdefault("improvements", [])
-    result.setdefault("missing_sections", [])
-    result.setdefault(
-        "keyword_analysis",
-        {
-            "important_keywords_found": [],
-            "important_keywords_missing": [],
-            "note": "",
-        },
-    )
-    result.setdefault("bullet_point_improvements", [])
-    result.setdefault("formatting_checklist", [])
-    result.setdefault("final_recommendation", "")
-
-    return result
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Gemini returned an invalid response."
+        ) from exc
 
 
 # ============================================================
-# UI rendering
+# SESSION STATE
 # ============================================================
 
-def render_score(score: int):
-    color = score_color(score)
-
-    if score >= 80:
-        label = "Strong ATS readiness"
-    elif score >= 60:
-        label = "Needs improvement"
-    else:
-        label = "Significant improvement needed"
-
-    st.markdown(
-        f"""
-        <div class="score-box">
-            <div class="score-number {color}">{score}/100</div>
-            <div class="score-label">{label}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_category_scores(category_scores: list):
-    if not category_scores:
-        return
-
-    st.subheader("📊 Score Breakdown")
-
-    for item in category_scores:
-        category = item.get("category", "Unknown")
-        score = normalize_score(item.get("score", 0))
-        max_score = normalize_score(item.get("max_score", 100))
-        feedback = item.get("feedback", "")
-
-        if max_score > 0:
-            percentage = min(100, int((score / max_score) * 100))
-        else:
-            percentage = 0
-
-        st.markdown(f"**{category} — {score}/{max_score}**")
-        st.progress(percentage)
-        st.caption(feedback)
-
-
-def render_improvements(improvements: list):
-    if not improvements:
-        st.info("No specific improvements were returned.")
-        return
-
-    for index, item in enumerate(improvements, start=1):
-        priority = item.get("priority", "Medium")
-        area = item.get("area", "General")
-        problem = item.get("problem", "")
-        recommendation = item.get("recommendation", "")
-        example = item.get("example", "")
-
-        with st.expander(
-            f"{index}. {priority} priority — {area}"
-        ):
-            st.markdown(f"**Problem:** {problem}")
-            st.markdown(f"**Recommendation:** {recommendation}")
-
-            if example:
-                st.markdown("**Example:**")
-                st.info(example)
+if "history" not in st.session_state:
+    st.session_state.history = []
 
 
 # ============================================================
-# Main application
+# HEADER
 # ============================================================
 
 st.markdown(
-    '<div class="main-title">📄 ATS Resume Analyzer</div>',
+    '<div class="main-title">🧮 AI Calculator</div>',
     unsafe_allow_html=True,
 )
 
 st.markdown(
     """
     <div class="subtitle">
-    Upload your resume and get an AI-powered ATS-readiness score,
-    keyword analysis, and actionable improvements.
+        Calculate numbers instantly or ask Gemini to solve
+        a calculation in natural language.
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
 with st.sidebar:
-    st.header("⚙️ Settings")
+
+    st.header("⚙️ Calculator")
 
     st.markdown(
         """
-        **Supported files**
-        - PDF
-        - DOCX
+        ### Examples
 
-        **AI model**
-        - Gemini 2.5 Flash
-
-        **Score**
-        - 0–100 ATS readiness estimate
+        - `25 * 18`
+        - `5000 / 12`
+        - `15% of 80000`
+        - `sqrt(144)`
+        - `2^10` is supported as `2**10`
+        - `What is 18% of 75000?`
+        - `If I save 20% of 90000, how much is that?`
         """
     )
 
     st.divider()
 
-    st.caption(
-        "Your resume is analyzed by Gemini. Do not upload confidential "
-        "information unless you are comfortable sending it to the "
-        "configured AI service."
-    )
+    if st.button(
+        "🗑️ Clear History",
+        use_container_width=True,
+    ):
+        st.session_state.history = []
+        st.rerun()
 
 
-uploaded_file = st.file_uploader(
-    "Upload your resume",
-    type=ALLOWED_EXTENSIONS,
-    help="Maximum recommended file size: 10 MB.",
-)
+# ============================================================
+# INPUT
+# ============================================================
 
-job_description = st.text_area(
-    "Optional: Paste the job description",
-    height=220,
+question = st.text_input(
+    "Enter your calculation",
     placeholder=(
-        "Paste the job description here to get "
-        "job-specific keyword and ATS recommendations..."
+        "Example: What is 18% of 75000?"
     ),
 )
 
-analyze_button = st.button(
-    "🔍 Analyze Resume",
+calculate_button = st.button(
+    "🧮 Calculate",
     type="primary",
     use_container_width=True,
 )
 
-if analyze_button:
 
-    if uploaded_file is None:
-        st.warning("Please upload a PDF or DOCX resume first.")
-        st.stop()
+# ============================================================
+# CALCULATION
+# ============================================================
 
-    file_size_mb = uploaded_file.size / (1024 * 1024)
+if calculate_button:
 
-    if file_size_mb > MAX_FILE_SIZE_MB:
-        st.error(
-            f"File is too large ({file_size_mb:.1f} MB). "
-            f"Please upload a file smaller than {MAX_FILE_SIZE_MB} MB."
+    if not question.strip():
+        st.warning(
+            "Please enter a calculation."
         )
         st.stop()
+
+    # --------------------------------------------------------
+    # First attempt: direct Python calculation
+    # --------------------------------------------------------
+
+    direct_expression = question.strip()
+
+    # Handle common natural-language percentage expressions.
+    percentage_match = re.fullmatch(
+        r"""
+        \s*
+        (?:what\s+is\s+)?
+        (\d+(?:\.\d+)?)\s*%
+        \s+of\s+
+        (\d+(?:\.\d+)?)
+        \s*\??\s*
+        """,
+        direct_expression,
+        flags=re.IGNORECASE | re.VERBOSE,
+    )
 
     try:
-        with st.spinner("Reading your resume..."):
-            resume_text = extract_resume_text(uploaded_file)
 
-        if not resume_text.strip():
-            st.error(
-                "I could not extract readable text from this resume. "
-                "If it is a scanned/image-only PDF, please use a text-based "
-                "PDF or DOCX version."
-            )
-            st.stop()
+        if percentage_match:
 
-        # Prevent sending an accidentally enormous extracted document.
-        # This is only a safety guard; normal resumes will be much smaller.
-        if len(resume_text) > 120_000:
-            resume_text = resume_text[:120_000]
-
-        with st.spinner("Gemini is analyzing your resume..."):
-            result = analyze_resume(
-                resume_text=resume_text,
-                job_description=job_description,
+            percentage = float(
+                percentage_match.group(1)
             )
 
-        st.session_state["analysis_result"] = result
-        st.session_state["resume_name"] = uploaded_file.name
+            number = float(
+                percentage_match.group(2)
+            )
 
-    except Exception as exc:
-        st.error(
-            "Something went wrong while analyzing the resume."
-        )
+            result = (
+                percentage / 100
+            ) * number
 
-        with st.expander("Technical details"):
-            st.exception(exc)
+            formatted_result = format_number(
+                result
+            )
 
+            st.markdown(
+                f"""
+                <div class="result-box">
+                    <div class="result-label">Result</div>
+                    <div class="result-value">
+                        {formatted_result}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-# ============================================================
-# Results
-# ============================================================
+            st.write(
+                f"{percentage}% of {format_number(number)} "
+                f"= **{formatted_result}**"
+            )
 
-if "analysis_result" in st.session_state:
+            st.session_state.history.insert(
+                0,
+                {
+                    "question": question,
+                    "answer": formatted_result,
+                    "method": "Python calculator",
+                },
+            )
 
-    result = st.session_state["analysis_result"]
-
-    st.divider()
-
-    st.subheader(
-        f"Results for `{st.session_state.get('resume_name', 'Resume')}`"
-    )
-
-    col1, col2 = st.columns([1, 2])
-
-    with col1:
-        render_score(result["ats_score"])
-
-    with col2:
-        st.markdown("### 📝 Summary")
-        st.write(result.get("score_summary", ""))
-
-        final_recommendation = result.get(
-            "final_recommendation",
-            "",
-        )
-
-        if final_recommendation:
-            st.info(final_recommendation)
-
-    st.divider()
-
-    render_category_scores(
-        result.get("category_scores", [])
-    )
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("✅ Strengths")
-
-        strengths = result.get("strengths", [])
-
-        if strengths:
-            for strength in strengths:
-                st.markdown(f"- {strength}")
         else:
-            st.write("No strengths returned.")
 
-    with col2:
-        st.subheader("🚨 Critical Issues")
+            # Try direct mathematical expression.
+            result = calculate_expression(
+                direct_expression
+            )
 
-        issues = result.get("critical_issues", [])
+            formatted_result = format_number(
+                result
+            )
 
-        if issues:
-            for issue in issues:
-                st.markdown(f"- {issue}")
-        else:
-            st.success("No critical issues identified.")
+            st.markdown(
+                f"""
+                <div class="result-box">
+                    <div class="result-label">Result</div>
+                    <div class="result-value">
+                        {formatted_result}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-    st.divider()
+            st.code(
+                f"{question} = {formatted_result}"
+            )
 
-    st.subheader("🛠️ Recommended Improvements")
-    render_improvements(
-        result.get("improvements", [])
-    )
+            st.session_state.history.insert(
+                0,
+                {
+                    "question": question,
+                    "answer": formatted_result,
+                    "method": "Python calculator",
+                },
+            )
 
-    st.divider()
+    except Exception:
 
-    # Keyword analysis
-    st.subheader("🔑 Keyword Analysis")
+        # ----------------------------------------------------
+        # If it isn't a normal expression, use Gemini.
+        # ----------------------------------------------------
 
-    keyword_data = result.get(
-        "keyword_analysis",
-        {},
-    )
+        try:
 
-    found = keyword_data.get(
-        "important_keywords_found",
-        [],
-    )
-
-    missing = keyword_data.get(
-        "important_keywords_missing",
-        [],
-    )
-
-    keyword_col1, keyword_col2 = st.columns(2)
-
-    with keyword_col1:
-        st.markdown("**Keywords found**")
-
-        if found:
-            st.write(", ".join(found))
-        else:
-            st.caption("No keywords were identified.")
-
-    with keyword_col2:
-        st.markdown("**Potentially missing keywords**")
-
-        if missing:
-            st.write(", ".join(missing))
-        else:
-            st.success("No important missing keywords identified.")
-
-    keyword_note = keyword_data.get("note", "")
-
-    if keyword_note:
-        st.caption(keyword_note)
-
-    st.divider()
-
-    # Missing sections
-    st.subheader("📋 Missing Sections")
-
-    missing_sections = result.get(
-        "missing_sections",
-        [],
-    )
-
-    if missing_sections:
-        for section in missing_sections:
-            st.markdown(f"- {section}")
-    else:
-        st.success("No obvious missing sections identified.")
-
-    st.divider()
-
-    # Bullet improvements
-    st.subheader("✍️ Bullet Point Improvements")
-
-    bullet_improvements = result.get(
-        "bullet_point_improvements",
-        [],
-    )
-
-    if bullet_improvements:
-        for item in bullet_improvements:
-            original = item.get("original", "")
-            improved = item.get("improved", "")
-            reason = item.get("reason", "")
-
-            with st.expander(
-                original[:100] if original else "Bullet improvement"
+            with st.spinner(
+                "Gemini is solving your calculation..."
             ):
-                st.markdown("**Original**")
-                st.write(original)
 
-                st.markdown("**Improved**")
-                st.success(improved)
+                ai_result = ask_gemini(
+                    question
+                )
 
-                if reason:
-                    st.caption(reason)
-    else:
-        st.info(
-            "No bullet-point rewrites were suggested."
-        )
+            answer = ai_result.get(
+                "answer",
+                "No answer returned.",
+            )
 
-    st.divider()
+            steps = ai_result.get(
+                "steps",
+                [],
+            )
 
-    # Formatting checklist
-    st.subheader("🎨 ATS Formatting Checklist")
-
-    formatting_items = result.get(
-        "formatting_checklist",
-        [],
-    )
-
-    if formatting_items:
-        for item in formatting_items:
-            name = item.get("item", "Formatting item")
-            status = item.get("status", "Unknown")
-            recommendation = item.get(
-                "recommendation",
+            explanation = ai_result.get(
+                "explanation",
                 "",
             )
 
             st.markdown(
-                f"**{name}:** {status}"
+                f"""
+                <div class="result-box">
+                    <div class="result-label">
+                        Gemini Result
+                    </div>
+                    <div class="result-value">
+                        {answer}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-            if recommendation:
-                st.caption(recommendation)
+            if steps:
+
+                st.subheader(
+                    "📐 Calculation Steps"
+                )
+
+                for index, step in enumerate(
+                    steps,
+                    start=1,
+                ):
+                    st.markdown(
+                        f"{index}. {step}"
+                    )
+
+            if explanation:
+
+                st.subheader(
+                    "💡 Explanation"
+                )
+
+                st.write(
+                    explanation
+                )
+
+            st.session_state.history.insert(
+                0,
+                {
+                    "question": question,
+                    "answer": answer,
+                    "method": "Gemini",
+                },
+            )
+
+        except Exception as exc:
+
+            st.error(
+                "I couldn't calculate that."
+            )
+
+            with st.expander(
+                "Technical details"
+            ):
+                st.exception(exc)
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+if st.session_state.history:
 
     st.divider()
 
-    # Raw JSON download
-    st.subheader("⬇️ Export Analysis")
-
-    json_data = json.dumps(
-        result,
-        indent=2,
-        ensure_ascii=False,
+    st.subheader(
+        "🕘 Calculation History"
     )
 
-    st.download_button(
-        label="Download analysis as JSON",
-        data=json_data,
-        file_name="resume_analysis.json",
-        mime="application/json",
-    )
+    for item in st.session_state.history[:10]:
+
+        st.markdown(
+            f"""
+            <div class="history-item">
+                <strong>
+                    {item["question"]}
+                </strong>
+                <br>
+                = {item["answer"]}
+                <br>
+                <small>
+                    Method: {item["method"]}
+                </small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "AI Calculator • Python handles direct arithmetic; "
+    "Gemini handles natural-language calculation problems."
+)
